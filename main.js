@@ -8,10 +8,12 @@
 import { View, div } from "gpui-kit";
 import { h_flex } from "gpui-base";
 import * as fs from "fs/promises";
-import { hc, exec, home, notify, theme, checking } from "herdr";
+import { hc, exec, home, notify, theme, checking, spaces, terminals, agents, nextCommand } from "herdr";
 
 const KEY = "records"; // { [address]: { kind, cmd, cwd, shellPid } }
-const EVERY_MS = 5000;
+const SAVE_EVERY_MS = 5 * 60 * 1000; // periodic save
+const WATCH_MS = 1000; // looks at live data already in memory: no process, no disk
+const SETTLE_TICKS = 2; // wait for changes to stop before saving, so a burst saves once
 const SETTLE_MS = 1500; // let the new shell print its prompt before typing
 
 const AGENTS = new Set(["claude-code", "claude", "codex"]);
@@ -94,39 +96,104 @@ async function json(args) {
 // No setTimeout in mods: wait through the machine.
 const sleep = (ms) => exec("sleep", [String(ms / 1000)]);
 
+const stamp = () => new Date().toTimeString().slice(0, 8);
+const diff = (a, b) => ({ added: b.filter((x) => !a.includes(x)), removed: a.filter((x) => !b.includes(x)) });
+
+// What the app already knows, read from memory. Each part is a list of strings.
+function observe() {
+  const ts = terminals();
+  return {
+    spaces: spaces().map((x) => x.id),
+    panes: ts.map((x) => x.address),
+    exited: ts.filter((x) => x.state && x.state !== "live").map((x) => x.address),
+    agents: agents().map((a) => `${a.address}:${a.app ?? ""}`),
+  };
+}
+
+// Why we are saving, from what changed between two observations.
+function reasons(prev, now) {
+  const out = [];
+  const sp = diff(prev.spaces, now.spaces);
+  if (sp.added.length) out.push("workspace created");
+  if (sp.removed.length) out.push("workspace closed");
+  const pn = diff(prev.panes, now.panes);
+  if (pn.added.length) out.push("pane created");
+  if (pn.removed.length) out.push("pane closed");
+  if (diff(prev.exited, now.exited).added.length) out.push("pane exited");
+  const ag = diff(prev.agents, now.agents);
+  if (ag.added.length) out.push("agent detected");
+  if (ag.removed.length && !ag.added.length) out.push("agent ended");
+  return out;
+}
+
 export default class AgentResume extends View {
   init(_props, cx) {
     this.records = {};
     try { this.records = JSON.parse(localStorage.getItem(KEY) ?? "{}"); } catch { this.records = {}; }
     this.busy = false;
-    this.last = "";
+    this.again = null; // a save asked for while one was running
+    this.last = ""; // "saved 23:41:07 (manual)" or an error
+    this.seen = null; // last observation
+    this.pending = []; // reasons waiting for changes to settle
+    this.settle = 0;
     if (checking()) return; // a check must not start helpers or type into terminals
-    this.tick(cx);
-    cx.timer.every(EVERY_MS, (cx) => this.tick(cx));
+
+    this.seen = observe();
+    this.snapshot(cx, "start");
+    cx.timer.every(SAVE_EVERY_MS, (cx) => this.snapshot(cx, "every 5 min"));
+    cx.timer.every(WATCH_MS, (cx) => this.watch(cx));
+
+    // Manual save: the palette entry (mod.json) and any key bound to "agent-resume.save".
+    cx.spawn(async (cx) => {
+      for (;;) {
+        const c = await nextCommand();
+        if (c === "save" || String(c).endsWith(".save")) this.snapshot(cx, "manual", true);
+      }
+    });
   }
 
   save() {
     localStorage.setItem(KEY, JSON.stringify(this.records));
   }
 
-  tick(cx) {
-    if (this.busy) return;
+  // Cheap, every second: did a workspace, pane or agent appear or go?
+  watch(cx) {
+    const now = observe();
+    const why = reasons(this.seen, now);
+    this.seen = now;
+    if (why.length) {
+      for (const r of why) if (!this.pending.includes(r)) this.pending.push(r);
+      this.settle = SETTLE_TICKS;
+      return;
+    }
+    if (this.pending.length && --this.settle <= 0) {
+      const reason = this.pending.join(", ");
+      this.pending = [];
+      this.snapshot(cx, reason);
+    }
+  }
+
+  snapshot(cx, reason, announce = false) {
+    if (this.busy) { this.again = this.again ?? reason; return; }
     this.busy = true;
     cx.spawn(async (cx) => {
       try {
         await this.scan();
+        this.last = `saved ${stamp()} (${reason})`;
+        if (announce) notify({ title: "Agent resume", body: `Saved ${Object.keys(this.records).length} agent(s)`, level: "success" });
       } catch (e) {
         this.last = `error: ${String(e?.message ?? e).slice(0, 80)}`;
       } finally {
         this.busy = false;
         cx.notify();
+        if (this.again) { const r = this.again; this.again = null; this.snapshot(cx, r); }
       }
     });
   }
 
   async scan() {
-    const { terminals } = await json(["ls", "--json"]);
-    const live = new Map(terminals.map((t) => [t.address, t]));
+    const { terminals: list } = await json(["ls", "--json"]);
+    const live = new Map(list.map((t) => [t.address, t]));
 
     // Terminals that are gone for good: forget them.
     for (const addr of Object.keys(this.records)) {
@@ -154,7 +221,6 @@ export default class AgentResume extends View {
           this.save();
           await sleep(SETTLE_MS);
           await hc(["send", addr, rec.cmd]);
-          this.last = `resumed ${addr}: ${rec.cmd}`;
           notify({ title: "Agent resumed", body: `${addr}: ${rec.cmd}`, level: "info" });
         } else if (t.state === "live") {
           // Quit on purpose; stop tracking.
@@ -165,7 +231,7 @@ export default class AgentResume extends View {
     this.save();
   }
 
-  render(_cx) {
+  render(cx) {
     const t = theme();
     const recs = Object.values(this.records);
     const n = recs.length;
@@ -173,12 +239,26 @@ export default class AgentResume extends View {
     return h_flex()
       .size_full()
       .px(10)
-      .gap(8)
+      .gap(10)
       .items_center()
       .bg(t.chrome)
       .text_size(11)
       .text_color(t.muted)
-      .child(`↻ agent-resume: tracking ${n} agent${n === 1 ? "" : "s"} (${exact} with exact session id)`)
-      .when(Boolean(this.last), (el) => el.child(div().truncate().text_color(t.dim).child(this.last)));
+      .child(`↻ agent-resume: ${n} agent${n === 1 ? "" : "s"} (${exact} exact id)`)
+      .child(div().flex_1().truncate().text_color(t.dim).child(this.last))
+      .child(
+        div()
+          .id("agent-resume-save")
+          .flex_none()
+          .px(8)
+          .py(1)
+          .rounded(4)
+          .bg(t.raised)
+          .text_color(this.busy ? t.dim : t.foreground)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => this.snapshot(cx, "manual", true))
+          .child(this.busy ? "Saving…" : "Save now"),
+      );
   }
 }

@@ -1,1 +1,8 @@
-{ "place": "bottom", "size": 22, "title": "Agent resume" }
+{
+  "place": "bottom",
+  "size": 22,
+  "title": "Agent resume",
+  "palette": [
+    { "title": "Agent resume: save now", "command": "agent-resume.save", "words": "save snapshot agents claude codex" }
+  ]
+}
